@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+use crossbeam_channel::{self, select, Sender, Receiver, RecvError};
 use devtools;
 use devtools_traits::DevtoolScriptControlMsg;
 use dom::abstractworker::{SharedRt, SimpleWorkerErrorHandler, WorkerScriptMsg};
@@ -39,7 +40,6 @@ use servo_url::ServoUrl;
 use std::mem::replace;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::{Receiver, RecvError, Select, Sender, channel};
 use std::thread;
 use style::thread_state::{self, ThreadState};
 
@@ -208,10 +208,10 @@ impl DedicatedWorkerGlobalScope {
             let runtime = unsafe { new_rt_and_cx() };
             *worker_rt_for_mainthread.lock().unwrap() = Some(SharedRt::new(&runtime));
 
-            let (devtools_mpsc_chan, devtools_mpsc_port) = channel();
+            let (devtools_mpsc_chan, devtools_mpsc_port) = crossbeam_channel::unbounded();
             ROUTER.route_ipc_receiver_to_mpsc_sender(from_devtools_receiver, devtools_mpsc_chan);
 
-            let (timer_tx, timer_rx) = channel();
+            let (timer_tx, timer_rx) = crossbeam_channel::unbounded();
             let (timer_ipc_chan, timer_ipc_port) = ipc::channel().unwrap();
             let worker_for_route = worker.clone();
             ROUTER.add_route(timer_ipc_port.to_opaque(), Box::new(move |message| {
@@ -267,7 +267,7 @@ impl DedicatedWorkerGlobalScope {
     }
 
     pub fn new_script_pair(&self) -> (Box<ScriptChan + Send>, Box<ScriptPort + Send>) {
-        let (tx, rx) = channel();
+        let (tx, rx) = crossbeam_channel::unbounded();
         let chan = Box::new(SendableWorkerScriptChan {
             sender: tx,
             worker: self.worker.borrow().as_ref().unwrap().clone(),
@@ -282,26 +282,18 @@ impl DedicatedWorkerGlobalScope {
         let timer_event_port = &self.timer_event_port;
         let devtools_port = scope.from_devtools_receiver();
 
-        let sel = Select::new();
-        let mut worker_handle = sel.handle(worker_port);
-        let mut timer_event_handle = sel.handle(timer_event_port);
-        let mut devtools_handle = sel.handle(devtools_port);
-        unsafe {
-            worker_handle.add();
-            timer_event_handle.add();
-            if scope.from_devtools_sender().is_some() {
-                devtools_handle.add();
+        loop {
+            if let Ok(msg) = select::recv(worker_port) {
+                break Ok(MixedMessage::FromWorker(msg));
             }
-        }
-        let ret = sel.wait();
-        if ret == worker_handle.id() {
-            Ok(MixedMessage::FromWorker(worker_port.recv()?))
-        } else if ret == timer_event_handle.id() {
-            Ok(MixedMessage::FromScheduler(timer_event_port.recv()?))
-        } else if ret == devtools_handle.id() {
-            Ok(MixedMessage::FromDevtools(devtools_port.recv()?))
-        } else {
-            panic!("unexpected select result!")
+            if let Ok(msg) = select::recv(timer_event_port) {
+                break Ok(MixedMessage::FromScheduler(msg));
+            }
+            if scope.from_devtools_sender().is_some() {
+                if let Ok(msg) = select::recv(devtools_port) {
+                    break Ok(MixedMessage::FromDevtools(msg));
+                }
+            }
         }
     }
 

@@ -5,10 +5,14 @@
 //! The layout thread. Performs layout on the DOM, builds display lists and sends them to be
 //! painted.
 
+#![feature(box_syntax)]
 #![feature(mpsc_select)]
+#![feature(nonzero)]
 
 extern crate app_units;
 extern crate atomic_refcell;
+extern crate core;
+extern crate crossbeam_channel;
 extern crate euclid;
 extern crate fnv;
 extern crate gfx;
@@ -52,6 +56,7 @@ extern crate webrender_api;
 mod dom_wrapper;
 
 use app_units::Au;
+use crossbeam_channel::{select, Receiver, Sender};
 use dom_wrapper::{ServoLayoutElement, ServoLayoutDocument, ServoLayoutNode};
 use dom_wrapper::drop_style_and_layout_data;
 use euclid::{Point2D, Rect, Size2D, TypedScale, TypedSize2D};
@@ -119,7 +124,6 @@ use std::ops::{Deref, DerefMut};
 use std::process;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 use style::animation::Animation;
 use style::context::{QuirksMode, RegisteredSpeculativePainter, RegisteredSpeculativePainters};
@@ -469,7 +473,7 @@ impl LayoutThread {
         debug!("Possible layout Threads: {}", layout_threads);
 
         // Create the channel on which new animations can be sent.
-        let (new_animations_sender, new_animations_receiver) = channel();
+        let (new_animations_sender, new_animations_receiver) = crossbeam_channel::unbounded();
 
         // Proxy IPC messages from the pipeline to the layout thread.
         let pipeline_receiver = ROUTER.route_ipc_receiver_to_new_mpsc_receiver(pipeline_port);
@@ -601,16 +605,15 @@ impl LayoutThread {
             let port_from_script = &self.port;
             let port_from_pipeline = &self.pipeline_port;
             let port_from_font_cache = &self.font_cache_receiver;
-            select! {
-                msg = port_from_pipeline.recv() => {
-                    Request::FromPipeline(msg.unwrap())
-                },
-                msg = port_from_script.recv() => {
-                    Request::FromScript(msg.unwrap())
-                },
-                msg = port_from_font_cache.recv() => {
-                    msg.unwrap();
-                    Request::FromFontCache
+            loop {
+                if let Ok(msg) = select::recv(port_from_pipeline) {
+                    break Request::FromPipeline(msg);
+                }
+                if let Ok(msg) = select::recv(port_from_script) {
+                    break Request::FromScript(msg);
+                }
+                if let Ok(()) = select::recv(port_from_font_cache) {
+                    break Request::FromFontCache;
                 }
             }
         };

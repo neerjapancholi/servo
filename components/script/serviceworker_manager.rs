@@ -7,6 +7,7 @@
 //! If an active service worker timeouts, then it removes the descriptor entry from its
 //! active_workers map
 
+use crossbeam_channel::{self, Sender, Receiver, RecvError, select};
 use devtools_traits::{DevtoolsPageInfo, ScriptToDevtoolsControlMsg};
 use dom::abstractworker::WorkerScriptMsg;
 use dom::bindings::structuredclone::StructuredCloneData;
@@ -19,7 +20,6 @@ use script_traits::{ServiceWorkerMsg, ScopeThings, SWManagerMsg, SWManagerSender
 use servo_config::prefs::PREFS;
 use servo_url::ServoUrl;
 use std::collections::HashMap;
-use std::sync::mpsc::{channel, Sender, Receiver, RecvError};
 use std::thread;
 
 enum Message {
@@ -79,7 +79,7 @@ impl ServiceWorkerManager {
     pub fn wakeup_serviceworker(&mut self, scope_url: ServoUrl) -> Option<Sender<ServiceWorkerScriptMsg>> {
         let scope_things = self.registered_workers.get(&scope_url);
         if let Some(scope_things) = scope_things {
-            let (sender, receiver) = channel();
+            let (sender, receiver) = crossbeam_channel::unbounded();
             let (devtools_sender, devtools_receiver) = ipc::channel().unwrap();
             if let Some(ref chan) = scope_things.devtools_chan {
                 let title = format!("ServiceWorker for {}", scope_things.script_url);
@@ -188,9 +188,16 @@ impl ServiceWorkerManager {
     fn receive_message(&mut self) -> Result<Message, RecvError> {
         let msg_from_constellation = &self.own_port;
         let msg_from_resource = &self.resource_receiver;
-        select! {
-            msg = msg_from_constellation.recv() => msg.map(Message::FromConstellation),
-            msg = msg_from_resource.recv() => msg.map(Message::FromResource)
+        loop {
+            if let Ok(msg) = select::recv(msg_from_constellation) {
+                break Ok(Message::FromConstellation(msg));
+            }
+            if let Ok(msg) = select::recv(msg_from_resource) {
+                break Ok(Message::FromResource(msg));
+            }
+            if select::disconnected() {
+                break Err(RecvError);
+            }
         }
     }
 }

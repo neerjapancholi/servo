@@ -104,6 +104,7 @@ use clipboard::{ClipboardContext, ClipboardProvider};
 use compositing::SendableFrameTree;
 use compositing::compositor_thread::{CompositorProxy, EmbedderMsg, EmbedderProxy};
 use compositing::compositor_thread::Msg as ToCompositorMsg;
+use crossbeam_channel::{self, select, Receiver, Sender};
 use debugger;
 use devtools_traits::{ChromeToDevtoolsControlMsg, DevtoolsControlMsg};
 use euclid::{Size2D, TypedSize2D, TypedScale};
@@ -151,7 +152,6 @@ use std::marker::PhantomData;
 use std::process;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 use style_traits::CSSPixel;
 use style_traits::cursor::Cursor;
@@ -533,7 +533,7 @@ fn route_ipc_receiver_to_new_mpsc_receiver_preserving_errors<T>(ipc_receiver: Ip
     -> Receiver<Result<T, IpcError>>
     where T: for<'de> Deserialize<'de> + Serialize + Send + 'static
 {
-        let (mpsc_sender, mpsc_receiver) = channel();
+        let (mpsc_sender, mpsc_receiver) = crossbeam_channel::unbounded();
         ROUTER.add_route(ipc_receiver.to_opaque(), Box::new(move |message| {
             drop(mpsc_sender.send(message.to::<T>()))
         }));
@@ -546,7 +546,7 @@ impl<Message, LTF, STF> Constellation<Message, LTF, STF>
 {
     /// Create a new constellation thread.
     pub fn start(state: InitialConstellationState) -> (Sender<FromCompositorMsg>, IpcSender<SWManagerMsg>) {
-        let (compositor_sender, compositor_receiver) = channel();
+        let (compositor_sender, compositor_receiver) = crossbeam_channel::unbounded();
 
         // service worker manager to communicate with constellation
         let (swmanager_sender, swmanager_receiver) = ipc::channel().expect("ipc channel failure");
@@ -559,7 +559,7 @@ impl<Message, LTF, STF> Constellation<Message, LTF, STF>
             let (ipc_layout_sender, ipc_layout_receiver) = ipc::channel().expect("ipc channel failure");
             let layout_receiver = route_ipc_receiver_to_new_mpsc_receiver_preserving_errors(ipc_layout_receiver);
 
-            let (network_listener_sender, network_listener_receiver) = channel();
+            let (network_listener_sender, network_listener_receiver) = crossbeam_channel::unbounded();
 
             let swmanager_receiver = route_ipc_receiver_to_new_mpsc_receiver_preserving_errors(swmanager_receiver);
 
@@ -927,19 +927,22 @@ impl<Message, LTF, STF> Constellation<Message, LTF, STF>
             let receiver_from_layout = &self.layout_receiver;
             let receiver_from_network_listener = &self.network_listener_receiver;
             let receiver_from_swmanager = &self.swmanager_receiver;
-            select! {
-                msg = receiver_from_script.recv() =>
-                    msg.expect("Unexpected script channel panic in constellation").map(Request::Script),
-                msg = receiver_from_compositor.recv() =>
-                    Ok(Request::Compositor(msg.expect("Unexpected compositor channel panic in constellation"))),
-                msg = receiver_from_layout.recv() =>
-                    msg.expect("Unexpected layout channel panic in constellation").map(Request::Layout),
-                msg = receiver_from_network_listener.recv() =>
-                    Ok(Request::NetworkListener(
-                        msg.expect("Unexpected network listener channel panic in constellation")
-                    )),
-                msg = receiver_from_swmanager.recv() =>
-                    msg.expect("Unexpected panic channel panic in constellation").map(Request::FromSWManager)
+            loop {
+                if let Ok(msg) = select::recv(receiver_from_script) {
+                    break msg.map(Request::Script);
+                }
+                if let Ok(msg) = select::recv(receiver_from_compositor) {
+                    break Ok(Request::Compositor(msg));
+                }
+                if let Ok(msg) = select::recv(receiver_from_layout) {
+                    break msg.map(Request::Layout);
+                }
+                if let Ok(msg) = select::recv(receiver_from_network_listener) {
+                    break Ok(Request::NetworkListener(msg));
+                }
+                if let Ok(msg) = select::recv(receiver_from_swmanager) {
+                    break msg.map(Request::FromSWManager);
+                }
             }
         };
 
